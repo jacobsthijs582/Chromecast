@@ -1,0 +1,393 @@
+name: Build APK
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: 17}
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: 8.7}
+      - name: Maak project
+        run: |
+          mkdir -p app/src/main/java/com/example/tvlauncher app/src/main/res/drawable-nodpi
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TvLauncher"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.tvlauncher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.tvlauncher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:label="TV Launcher"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:screenOrientation="landscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".NotifService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/tvlauncher/MainActivity.kt <<'EOF'
+          package com.example.tvlauncher
+
+          import android.app.Activity
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.StateListDrawable
+          import android.media.MediaMetadata
+          import android.media.session.MediaController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.service.notification.NotificationListenerService
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.*
+
+          class NotifService : NotificationListenerService()
+
+          class MainActivity : Activity() {
+
+              data class App(val pkg: String, val name: String, val intent: Intent, val icon: Drawable)
+
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var prefs: SharedPreferences
+              private lateinit var dock: LinearLayout
+              private lateinit var label: TextView
+              private lateinit var now: TextView
+              private lateinit var home: LinearLayout
+              private lateinit var grid: GridView
+              private lateinit var weather: TextView
+              private val LAT = 52.37
+              private val LON = 4.90
+              private var apps = listOf<App>()
+              private var controller: MediaController? = null
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun glass(focused: Boolean) = GradientDrawable().apply {
+                  cornerRadius = dp(20).toFloat()
+                  setColor(if (focused) 0x44FFFFFF else 0x22FFFFFF)
+                  if (focused) setStroke(dp(3), Color.WHITE)
+              }
+
+              private fun focusBg() = StateListDrawable().apply {
+                  addState(intArrayOf(android.R.attr.state_focused), glass(true))
+                  addState(intArrayOf(), glass(false))
+              }
+
+              private fun text(s: String, size: Float, color: Int = Color.WHITE, face: String = "sans-serif") =
+                  TextView(this).apply {
+                      text = s; textSize = size; setTextColor(color)
+                      typeface = Typeface.create(face, Typeface.NORMAL)
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("launcher", MODE_PRIVATE)
+
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(0xFF0F2A22.toInt())
+                  root.addView(ImageView(this).apply {
+                      setImageResource(R.drawable.wallpaper); scaleType = ImageView.ScaleType.CENTER_CROP
+                  }, ViewGroup.LayoutParams(-1, -1))
+                  root.addView(View(this).apply { setBackgroundColor(0x77000000) }, ViewGroup.LayoutParams(-1, -1))
+
+                  home = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(dp(48), dp(40), dp(48), dp(40))
+                  }
+
+                  val date = TextClock(this).apply {
+                      format12Hour = "EEEE d MMMM"; format24Hour = "EEEE d MMMM"
+                      textSize = 20f; setTextColor(0xCCFFFFFF.toInt()); gravity = Gravity.CENTER
+                  }
+                  val clock = TextClock(this).apply {
+                      format12Hour = "HH:mm"; format24Hour = "HH:mm"
+                      textSize = 96f; setTextColor(0xF2FFFFFF.toInt()); gravity = Gravity.CENTER
+                      typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+                  }
+                  home.addView(date)
+                  home.addView(clock)
+                  home.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+
+                  now = text("", 16f).apply {
+                      gravity = Gravity.CENTER
+                      setPadding(dp(24), dp(12), dp(24), dp(12))
+                      isFocusable = true; isClickable = true
+                      background = focusBg(); visibility = View.GONE
+                      setOnClickListener { togglePlay() }
+                  }
+                  home.addView(now, LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(16) })
+
+                  dock = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setPadding(dp(16), dp(12), dp(16), dp(12))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(32).toFloat(); setColor(0x33FFFFFF)
+                          setStroke(dp(2), 0x66FFFFFF)
+                      }
+                  }
+                  home.addView(dock, LinearLayout.LayoutParams(-2, -2))
+
+                  label = text("", 14f, 0xCCFFFFFF.toInt()).apply { gravity = Gravity.CENTER }
+                  home.addView(label, LinearLayout.LayoutParams(-2, dp(32)).apply { topMargin = dp(8) })
+
+                  val quick = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+                  listOf(
+                      "Wifi" to Settings.ACTION_WIFI_SETTINGS, "Bluetooth" to Settings.ACTION_BLUETOOTH_SETTINGS,
+                      "Beeld" to Settings.ACTION_DISPLAY_SETTINGS, "Geluid" to Settings.ACTION_SOUND_SETTINGS,
+                      "Alles" to Settings.ACTION_SETTINGS
+                  ).forEach { (n, a) ->
+                      quick.addView(tile(text(n, 12f).apply { gravity = Gravity.CENTER }, n,
+                          { try { startActivity(Intent(a)) } catch (e: Exception) {} }).apply {
+                          layoutParams = LinearLayout.LayoutParams(dp(88), dp(56)).apply { setMargins(dp(6), 0, dp(6), 0) }
+                      })
+                  }
+                  home.addView(quick)
+
+                  grid = GridView(this).apply {
+                      numColumns = 6; verticalSpacing = dp(12); horizontalSpacing = dp(12)
+                      setPadding(dp(48), dp(48), dp(48), dp(48))
+                      selector = glass(true)
+                      visibility = View.GONE
+                      setOnItemClickListener { _, _, i, _ -> launch(apps[i]) }
+                      setOnItemLongClickListener { _, _, i, _ -> toggleDock(apps[i].pkg); true }
+                  }
+
+                  root.addView(home, ViewGroup.LayoutParams(-1, -1))
+                  weather = text("", 16f).apply { setPadding(dp(16), dp(8), dp(16), dp(8)); background = glass(false) }
+                  root.addView(weather, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply { setMargins(0, dp(24), dp(32), 0) })
+                  root.addView(grid, ViewGroup.LayoutParams(-1, -1))
+                  setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  loadApps(); buildDock(); showGrid(false); loadWeather()
+                  h.post(poll)
+              }
+
+              override fun onPause() { h.removeCallbacks(poll); super.onPause() }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() { if (grid.visibility == View.VISIBLE) showGrid(false) }
+
+              override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); showGrid(false) }
+
+              private fun loadWeather() {
+                  Thread {
+                      try {
+                          val u = java.net.URL("https://api.open-meteo.com/v1/forecast?latitude=$LAT&longitude=$LON&current=temperature_2m")
+                          val t = org.json.JSONObject(u.readText()).getJSONObject("current").getDouble("temperature_2m")
+                          runOnUiThread { weather.text = "${Math.round(t)}°" }
+                      } catch (e: Exception) { }
+                  }.start()
+              }
+
+              private fun loadApps() {
+                  val pm = packageManager
+                  val found = mutableMapOf<String, App>()
+                  for (cat in listOf(Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER)) {
+                      val q = Intent(Intent.ACTION_MAIN).addCategory(cat)
+                      for (ri in pm.queryIntentActivities(q, 0)) {
+                          val pkg = ri.activityInfo.packageName
+                          if (pkg == packageName || found.containsKey(pkg)) continue
+                          val i = pm.getLeanbackLaunchIntentForPackage(pkg) ?: pm.getLaunchIntentForPackage(pkg) ?: continue
+                          found[pkg] = App(pkg, ri.loadLabel(pm).toString(), i, ri.loadIcon(pm))
+                      }
+                  }
+                  apps = found.values.sortedBy { it.name.lowercase() }
+                  grid.adapter = object : BaseAdapter() {
+                      override fun getCount() = apps.size
+                      override fun getItem(p: Int) = apps[p]
+                      override fun getItemId(p: Int) = p.toLong()
+                      override fun getView(p: Int, v: View?, parent: ViewGroup): View {
+                          val a = apps[p]
+                          return LinearLayout(this@MainActivity).apply {
+                              orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                              setPadding(dp(8), dp(16), dp(8), dp(12))
+                              addView(ImageView(context).apply { setImageDrawable(a.icon) }, LinearLayout.LayoutParams(dp(72), dp(72)))
+                              addView(text(a.name, 13f).apply { gravity = Gravity.CENTER; maxLines = 1 })
+                          }
+                      }
+                  }
+              }
+
+              private fun dockList(): MutableList<String> {
+                  val saved = prefs.getString("dock", null)
+                  if (saved != null) return saved.split(",").filter { it.isNotEmpty() }.toMutableList()
+                  val wanted = listOf("com.google.android.youtube.tv", "com.spotify.tv.android", "com.stremio.one")
+                  val installed = wanted.filter { w -> apps.any { it.pkg == w } }
+                  return (if (installed.isNotEmpty()) installed else apps.take(3).map { it.pkg }).toMutableList()
+              }
+
+              private fun toggleDock(pkg: String) {
+                  val l = dockList()
+                  if (!l.remove(pkg)) l.add(pkg)
+                  prefs.edit().putString("dock", l.joinToString(",")).apply()
+                  buildDock()
+                  Toast.makeText(this, if (l.contains(pkg)) "Toegevoegd aan dock" else "Verwijderd uit dock", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun tile(content: View, name: String, click: () -> Unit, long: (() -> Unit)? = null): View =
+                  FrameLayout(this).apply {
+                      isFocusable = true; isClickable = true
+                      background = focusBg()
+                      val pad = dp(14)
+                      setPadding(pad, pad, pad, pad)
+                      addView(content, FrameLayout.LayoutParams(-1, -1))
+                      setOnClickListener { click() }
+                      if (long != null) setOnLongClickListener { long(); true }
+                      setOnFocusChangeListener { v, f ->
+                          v.animate().scaleX(if (f) 1.15f else 1f).scaleY(if (f) 1.15f else 1f).setDuration(120).start()
+                          if (f) label.text = name
+                      }
+                      layoutParams = LinearLayout.LayoutParams(dp(96), dp(96)).apply { setMargins(dp(8), dp(4), dp(8), dp(4)) }
+                  }
+
+              private fun buildDock() {
+                  dock.removeAllViews()
+                  for (pkg in dockList()) {
+                      val a = apps.firstOrNull { it.pkg == pkg } ?: continue
+                      dock.addView(tile(ImageView(this).apply { setImageDrawable(a.icon) }, a.name, { launch(a) }, { toggleDock(pkg) }))
+                  }
+                  dock.addView(tile(text("⠿", 34f).apply { gravity = Gravity.CENTER }, "Alle apps", { showGrid(true) }))
+                  dock.addView(tile(text("⚙", 34f).apply { gravity = Gravity.CENTER }, "Instellingen",
+                      { startActivity(Intent(Settings.ACTION_SETTINGS)) }))
+                  dock.getChildAt(0)?.requestFocus()
+              }
+
+              private fun showGrid(show: Boolean) {
+                  grid.visibility = if (show) View.VISIBLE else View.GONE
+                  home.visibility = if (show) View.GONE else View.VISIBLE
+                  if (show) grid.requestFocus() else dock.getChildAt(0)?.requestFocus()
+              }
+
+              private fun launch(a: App) {
+                  try { startActivity(a.intent) } catch (e: Exception) {
+                      Toast.makeText(this, "Kan ${a.name} niet openen", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun togglePlay() {
+                  val c = controller ?: return
+                  if (c.playbackState?.state == PlaybackState.STATE_PLAYING) c.transportControls.pause()
+                  else c.transportControls.play()
+              }
+
+              private val poll = object : Runnable {
+                  override fun run() { updateNow(); h.postDelayed(this, 2000) }
+              }
+
+              private fun updateNow() {
+                  try {
+                      val msm = getSystemService(MediaSessionManager::class.java)
+                      val c = msm.getActiveSessions(ComponentName(this, NotifService::class.java)).firstOrNull {
+                          val s = it.playbackState?.state
+                          s == PlaybackState.STATE_PLAYING || s == PlaybackState.STATE_PAUSED
+                      }
+                      controller = c
+                      if (c == null) { now.visibility = View.GONE; return }
+                      val m = c.metadata
+                      val title = m?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: ""
+                      val artist = m?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
+                      val icon = if (c.playbackState?.state == PlaybackState.STATE_PLAYING) "⏸" else "▶"
+                      now.text = "$icon  $title\n$artist"
+                      now.visibility = View.VISIBLE
+                  } catch (e: SecurityException) {
+                      now.visibility = View.GONE
+                  }
+              }
+          }
+          EOF
+          cp wallpaper.jpg app/src/main/res/drawable-nodpi/wallpaper.jpg
+      - name: Bouw APK
+        run: gradle assembleDebug --no-daemon
+      - name: Zet APK in Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk --title "TV launcher ${{ github.run_number }}" --notes "Download app-debug.apk"
